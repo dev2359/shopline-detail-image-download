@@ -156,6 +156,23 @@ def strip_ns(tag: str) -> str:
     return tag
 
 
+def parse_sitemap_loose(xml_text: str) -> list[str]:
+    urls: list[str] = []
+    for loc in re.findall(r"<loc>(.*?)</loc>", xml_text, re.IGNORECASE | re.DOTALL):
+        loc = loc.strip()
+        if not loc:
+            continue
+        loc = (
+            loc.replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+        )
+        urls.append(loc)
+    return urls
+
+
 def parse_sitemap(url: str, seen: set[str] | None = None) -> list[str]:
     if seen is None:
         seen = set()
@@ -163,8 +180,11 @@ def parse_sitemap(url: str, seen: set[str] | None = None) -> list[str]:
         return []
     seen.add(url)
 
-    xml_text = fetch_text(url)
-    root = ET.fromstring(xml_text)
+    xml_text = fetch_text_force_utf8(url)
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        return parse_sitemap_loose(xml_text)
     tag = strip_ns(root.tag).lower()
 
     urls: list[str] = []
@@ -183,6 +203,21 @@ def parse_sitemap(url: str, seen: set[str] | None = None) -> list[str]:
             if loc is not None and loc.text:
                 urls.append(loc.text.strip())
     return urls
+
+
+def discover_sitemaps(base: str) -> list[str]:
+    robots_url = f"{base.rstrip('/')}/robots.txt"
+    try:
+        text = fetch_text_force_utf8(robots_url)
+    except Exception:
+        return []
+    sitemaps: list[str] = []
+    for line in text.splitlines():
+        if line.lower().startswith("sitemap:"):
+            url = line.split(":", 1)[1].strip()
+            if url:
+                sitemaps.append(url)
+    return sitemaps
 
 
 def is_product_url(url: str) -> bool:
@@ -280,7 +315,11 @@ def extract_detail_images_with_playwright(url: str) -> list[str]:
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        page.goto(url, wait_until="networkidle", timeout=60000)
+        try:
+            page.goto(url, wait_until="networkidle", timeout=45000)
+        except Exception:
+            # Fallback to less strict load conditions
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
         try:
             page.wait_for_selector(".ProductDetail-description", timeout=10000)
         except Exception:
@@ -333,6 +372,19 @@ def extract_product_json(html: str) -> dict[str, Any] | None:
         return json.loads(blob)
     except Exception:
         return None
+
+
+def extract_product_id_from_rel(html: str) -> str:
+    # Example: <div id="product_id" rel="9c019a5baad2"></div>
+    patterns = [
+        r'id=["\']product_id["\'][^>]*\brel=["\']([^"\']+)["\']',
+        r'\brel=["\']([^"\']+)["\'][^>]*\bid=["\']product_id["\']',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return ""
 
 
 def extract_gallery_thumbs(html: str) -> list[str]:
@@ -466,18 +518,24 @@ def process_product_url(
     base: str,
     out_dir: str,
     debug: bool = False,
+    external_base: str = "",
+    external_folder: str = "",
+    external_prefix: str = "",
+    thumbs_only: bool = False,
 ) -> tuple[str, list[str], list[str]]:
     html = fetch_text_force_utf8(url)
     product = extract_product_json(html) or {}
-    product_id = str(product.get("id") or "").strip() or None
+    rel_id = extract_product_id_from_rel(html)
+    product_id = rel_id or str(product.get("id") or "").strip() or None
 
     # Extract detail images only from ProductDetail-description block (rendered)
     detail_candidates: list[str] = []
-    rendered_urls = extract_detail_images_with_playwright(url)
-    for src in rendered_urls:
-        abs_url = normalize_url(src, base)
-        if is_likely_product_image(abs_url) and is_detail_candidate(abs_url):
-            detail_candidates.append(abs_url)
+    if not thumbs_only:
+        rendered_urls = extract_detail_images_with_playwright(url)
+        for src in rendered_urls:
+            abs_url = normalize_url(src, base)
+            if is_likely_product_image(abs_url) and is_detail_candidate(abs_url):
+                detail_candidates.append(abs_url)
 
     pattern_count = 0
 
@@ -503,7 +561,7 @@ def process_product_url(
         if img_id not in thumb_best or size_score(u) > size_score(thumb_best[img_id]):
             thumb_best[img_id] = u
 
-    detail_urls = [detail_best[i] for i in detail_order if i in detail_best]
+    detail_urls = [] if thumbs_only else [detail_best[i] for i in detail_order if i in detail_best]
     thumb_urls = [thumb_best[i] for i in thumb_order if i in thumb_best]
 
     if debug:
@@ -520,36 +578,68 @@ def process_product_url(
     os.makedirs(product_dir, exist_ok=True)
 
     # Save image HTML (separate)
-    detail_html = [f'<img src="{u}" style="display:block;" />' for u in detail_urls]
-    thumb_html = [f'<img src="{u}" />' for u in thumb_urls]
-    with open(os.path.join(product_dir, "images_detail.html"), "w", encoding="utf-8") as f:
-        f.write("\n".join(detail_html))
-    with open(os.path.join(product_dir, "images_thumb.html"), "w", encoding="utf-8") as f:
-        f.write("\n".join(thumb_html))
+    external_base = external_base.rstrip("/")
+    external_folder = external_folder.strip().strip("/")
+    external_prefix = external_prefix.strip()
+    id_for_path = product_id or os.path.basename(product_dir)
+    detail_html: list[str] = []
+    thumb_html: list[str] = []
+    base_path = ""
+    if external_base:
+        if external_folder:
+            base_path = f"{external_base}/{external_folder}/{id_for_path}"
+        elif not thumbs_only:
+            base_path = external_base
 
-    # Save source URL and HTML
-    with open(os.path.join(product_dir, "product_url.txt"), "w", encoding="utf-8") as f:
-        f.write(url)
-    with open(os.path.join(product_dir, "product_page.html"), "w", encoding="utf-8") as f:
-        f.write(html)
+    if thumbs_only:
+        if base_path and thumb_urls:
+            thumb_ext = os.path.splitext(urllib.parse.urlparse(thumb_urls[0]).path)[1] or ".jpg"
+            thumb_url = f"{base_path}/thumb{thumb_ext}"
+        else:
+            thumb_url = thumb_urls[0] if thumb_urls else ""
+        if thumb_url:
+            detail_html = [f'<img src="{thumb_url}" style="display:block;" />']
+    elif external_base:
+        for idx, src in enumerate(detail_urls):
+            if idx > 99:
+                break
+            ext = os.path.splitext(urllib.parse.urlparse(src).path)[1] or ".jpg"
+            name = f"{external_prefix}{idx}{ext}"
+            url = f"{base_path}/{name}"
+            detail_html.append(f'<img src="{url}" style="display:block;" />')
+        # Only images_detail.html is needed; skip generating thumbnail HTML
+    else:
+        detail_html = [f'<img src="{u}" style="display:block;" />' for u in detail_urls]
+        # Only images_detail.html is needed; skip generating thumbnail HTML
+    if not thumbs_only:
+        with open(os.path.join(product_dir, "images_detail.html"), "w", encoding="utf-8") as f:
+            f.write("\n".join(detail_html))
+    # images_thumb.html is intentionally omitted
+
+    # Save source URL
+    if not thumbs_only:
+        with open(os.path.join(product_dir, "product_url.txt"), "w", encoding="utf-8") as f:
+            f.write(url)
 
     # Download images into separate folders
-    for idx, img_url in enumerate(detail_urls):
-        if idx > 99:
-            break
-        parsed = urllib.parse.urlparse(img_url)
-        ext = os.path.splitext(parsed.path)[1] or ".jpg"
-        img_name = f"{idx}{ext}"
-        img_path = os.path.join(product_dir, "detail", img_name)
-        try:
-            download_file(img_url, img_path)
-        except Exception as exc:
-            print(f"  Failed image: {img_url} ({exc})")
+    if not thumbs_only:
+        for idx, img_url in enumerate(detail_urls):
+            if idx > 99:
+                break
+            parsed = urllib.parse.urlparse(img_url)
+            ext = os.path.splitext(parsed.path)[1] or ".jpg"
+            prefix = external_prefix or ""
+            img_name = f"{prefix}{idx}{ext}"
+            img_path = os.path.join(product_dir, img_name)
+            try:
+                download_file(img_url, img_path)
+            except Exception as exc:
+                print(f"  Failed image: {img_url} ({exc})")
 
     if thumb_urls:
         first_thumb = thumb_urls[0]
-        thumb_name = f"thumb_{folder_id}.jpg"
-        thumb_path = os.path.join(product_dir, "thumbs", thumb_name)
+        thumb_name = "thumb.jpg"
+        thumb_path = os.path.join(product_dir, thumb_name)
         try:
             download_file(first_thumb, thumb_path)
         except Exception as exc:
@@ -566,7 +656,24 @@ def run_for_base(
     max_products: int,
     debug: bool,
     progress_cb: Callable[[int, int, str], None] | None = None,
+    external_base: str = "",
+    external_folder: str = "",
+    external_prefix: str = "",
+    thumbs_only: bool = False,
 ) -> list[str]:
+    # Prefer www. sitemap if available to avoid non-www redirects/HTML
+    parsed_base = urllib.parse.urlparse(base)
+    if parsed_base.netloc and not parsed_base.netloc.startswith("www."):
+        www_base = f"{parsed_base.scheme}://www.{parsed_base.netloc}"
+        www_sitemap = f"{www_base}/sitemap.xml"
+        try:
+            www_urls = parse_sitemap(www_sitemap)
+        except Exception:
+            www_urls = []
+        if www_urls:
+            base = www_base
+            sitemap_url = www_sitemap
+
     try:
         all_urls = parse_sitemap(sitemap_url)
     except Exception as exc:
@@ -590,6 +697,38 @@ def run_for_base(
         product_urls = product_urls[: max_products]
 
     if not product_urls:
+        # Try robots.txt-discovered sitemaps
+        extra_sitemaps = discover_sitemaps(base)
+        for sm in extra_sitemaps:
+            try:
+                more_urls = parse_sitemap(sm)
+            except Exception:
+                continue
+            for u in more_urls:
+                if is_product_url(u):
+                    product_urls.append(u)
+        product_urls = list(dict.fromkeys(product_urls))
+
+    if not product_urls:
+        # Try www. variant for base if not already
+        parsed = urllib.parse.urlparse(base)
+        if parsed.netloc and not parsed.netloc.startswith("www."):
+            www_base = f"{parsed.scheme}://www.{parsed.netloc}"
+            www_sitemap = f"{www_base}/sitemap.xml"
+            try:
+                all_urls = parse_sitemap(www_sitemap)
+            except Exception:
+                all_urls = []
+            if not all_urls:
+                for sm in discover_sitemaps(www_base):
+                    try:
+                        all_urls.extend(parse_sitemap(sm))
+                    except Exception:
+                        continue
+            product_urls = [u for u in all_urls if is_product_url(u)]
+            product_urls = list(dict.fromkeys(product_urls))
+
+    if not product_urls:
         print("No product URLs found in sitemap. Provide a sitemap URL or add a crawler.")
         return []
 
@@ -600,7 +739,16 @@ def run_for_base(
     for idx, url in enumerate(product_urls, start=1):
         print(f"[{idx}/{total}] {url}")
         try:
-            product_dir, _, _ = process_product_url(url, base, out_dir, debug=debug)
+            product_dir, _, _ = process_product_url(
+                url,
+                base,
+                out_dir,
+                debug=debug,
+                external_base=external_base,
+                external_folder=external_folder,
+                external_prefix=external_prefix,
+                thumbs_only=thumbs_only,
+            )
             product_dirs.append(product_dir)
         except Exception as exc:
             print(f"  Failed product: {url} ({exc})")
@@ -618,13 +766,57 @@ def run_for_product(
     out_dir: str,
     debug: bool,
     progress_cb: Callable[[int, int, str], None] | None = None,
+    external_base: str = "",
+    external_folder: str = "",
+    external_prefix: str = "",
+    thumbs_only: bool = False,
 ) -> list[str]:
     parsed = urllib.parse.urlparse(product_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
-    product_dir, _, _ = process_product_url(product_url, base, out_dir, debug=debug)
+    product_dir, _, _ = process_product_url(
+        product_url,
+        base,
+        out_dir,
+        debug=debug,
+        external_base=external_base,
+        external_folder=external_folder,
+        external_prefix=external_prefix,
+        thumbs_only=thumbs_only,
+    )
     if progress_cb:
         progress_cb(1, 1, product_url)
     return [product_dir]
+
+
+def run_for_products(
+    product_urls: list[str],
+    out_dir: str,
+    debug: bool,
+    progress_cb: Callable[[int, int, str], None] | None = None,
+    external_base: str = "",
+    external_folder: str = "",
+    external_prefix: str = "",
+    thumbs_only: bool = False,
+) -> list[str]:
+    product_dirs: list[str] = []
+    total = len(product_urls)
+    for idx, product_url in enumerate(product_urls, start=1):
+        parsed = urllib.parse.urlparse(product_url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        product_dir, _, _ = process_product_url(
+            product_url,
+            base,
+            out_dir,
+            debug=debug,
+            external_base=external_base,
+            external_folder=external_folder,
+            external_prefix=external_prefix,
+            thumbs_only=thumbs_only,
+        )
+        product_dirs.append(product_dir)
+        if progress_cb:
+            progress_cb(idx, total, product_url)
+    return product_dirs
 
 
 def zip_directory(src_dir: str, zip_path: str) -> None:
@@ -655,10 +847,14 @@ def _run_job(job_id: str, params: dict[str, Any]) -> None:
     try:
         base = params.get("base") or ""
         sitemap = params.get("sitemap") or ""
-        product_url = params.get("product_url") or ""
+        product_urls = params.get("product_url") or []
         delay = float(params.get("delay") or 0.5)
         max_products = int(params.get("max_products") or 0)
         output_root = params.get("output_root") or os.getcwd()
+        external_base = (params.get("external_base") or "").strip()
+        external_folder = (params.get("external_folder") or "").strip()
+        external_prefix = (params.get("external_prefix") or "").strip()
+        thumbs_only = bool(params.get("thumbs_only"))
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = os.path.join(output_root, f"web_output_{stamp}_{job_id[:8]}")
@@ -667,16 +863,37 @@ def _run_job(job_id: str, params: dict[str, Any]) -> None:
         def progress(done: int, total: int, current: str) -> None:
             _set_job(job_id, done=done, total=total, current=current)
 
-        if product_url:
+        if product_urls:
             _set_job(job_id, mode="product")
-            run_for_product(product_url, out_dir, debug=False, progress_cb=progress)
+            run_for_products(
+                product_urls,
+                out_dir,
+                debug=False,
+                progress_cb=progress,
+                external_base=external_base,
+                external_folder=external_folder,
+                external_prefix=external_prefix,
+                thumbs_only=thumbs_only,
+            )
         else:
             if not base:
                 raise ValueError("base is required")
             base = base.rstrip("/")
             sitemap_url = sitemap or f"{base}/sitemap.xml"
             _set_job(job_id, mode="base")
-            run_for_base(base, out_dir, sitemap_url, delay, max_products, debug=False, progress_cb=progress)
+            run_for_base(
+                base,
+                out_dir,
+                sitemap_url,
+                delay,
+                max_products,
+                debug=False,
+                progress_cb=progress,
+                external_base=external_base,
+                external_folder=external_folder,
+                external_prefix=external_prefix,
+                thumbs_only=thumbs_only,
+            )
 
         zip_path = f"{out_dir}.zip"
         zip_directory(out_dir, zip_path)
@@ -763,21 +980,22 @@ class DownloadHandler(http.server.BaseHTTPRequestHandler):
     <title>Shopline Image Downloader</title>
     <style>
       :root {
-        --bg1: #0f172a;
-        --bg2: #111827;
-        --card: #0b1220;
-        --accent: #38bdf8;
+        --bg1: #0b1220;
+        --bg2: #0f172a;
+        --card: #0b1526;
+        --accent: #5ea2ff;
         --text: #e5e7eb;
-        --muted: #94a3b8;
+        --muted: #9aa4b2;
         --danger: #f87171;
-        --ok: #22c55e;
+        --ok: #34d399;
+        --border: #2c3a52;
       }
       body {
         margin: 0;
         min-height: 100vh;
         font-family: "Noto Sans KR", "Segoe UI", Arial, sans-serif;
         color: var(--text);
-        background: radial-gradient(1200px 800px at 20% 0%, #1f2937, var(--bg2));
+        background: radial-gradient(1200px 800px at 20% 0%, #111c2e, var(--bg2));
       }
       .wrap {
         max-width: 880px;
@@ -785,29 +1003,45 @@ class DownloadHandler(http.server.BaseHTTPRequestHandler):
         padding: 36px 24px 60px;
       }
       .card {
-        background: linear-gradient(180deg, #0f172a, var(--card));
-        border: 1px solid #1f2937;
+        background: var(--card);
+        border: 1px solid var(--border);
         border-radius: 16px;
         padding: 24px;
-        box-shadow: 0 12px 30px rgba(0,0,0,0.35);
+        box-shadow: 0 12px 30px rgba(15, 23, 42, 0.12);
       }
       h1 { margin: 0 0 8px; font-size: 26px; }
       p { margin: 6px 0 16px; color: var(--muted); }
-      .grid { display: grid; grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr); gap: 20px; }
+      .grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+      .row-inline { display: flex; gap: 8px; align-items: center; }
+      .row-inline input { flex: 1; }
+      .row-inline button { height: 40px; padding: 0 12px; }
+      .toggle {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+        color: var(--muted);
+        cursor: pointer;
+        user-select: none;
+      }
+      .toggle input { width: auto; }
+      .section { padding: 8px 0; border-top: 1px solid #1f2937; }
+      .section:first-child { border-top: none; }
       label { display: block; margin: 10px 0 6px; font-size: 14px; color: var(--muted); }
       input {
         width: 100%;
+        box-sizing: border-box;
         padding: 10px 12px;
         border-radius: 10px;
-        border: 1px solid #334155;
-        background: #0b1220;
+        border: 1px solid var(--border);
+        background: #0a1424;
         color: var(--text);
         outline: none;
-        box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.15);
+        box-shadow: inset 0 0 0 1px rgba(94, 162, 255, 0.15);
       }
       input:focus {
         border-color: var(--accent);
-        box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
+        box-shadow: 0 0 0 2px rgba(94, 162, 255, 0.25);
       }
       .actions { margin-top: 16px; display: flex; gap: 10px; align-items: center; }
       button {
@@ -819,21 +1053,21 @@ class DownloadHandler(http.server.BaseHTTPRequestHandler):
         font-weight: 600;
         cursor: pointer;
       }
-      button.secondary { background: #1f2937; color: var(--text); }
+      button.secondary { background: #1b2842; color: var(--text); border: 1px solid var(--border); }
       .progress-wrap {
         margin-top: 18px;
         padding: 12px;
         border-radius: 12px;
-        border: 1px dashed #1f2937;
-        background: #0b1220;
+        border: 1px dashed var(--border);
+        background: #0a1424;
       }
       .bar {
         width: 100%;
         height: 10px;
-        background: #0f172a;
+        background: #0b1629;
         border-radius: 999px;
         overflow: hidden;
-        border: 1px solid #1f2937;
+        border: 1px solid var(--border);
       }
       .bar > span {
         display: block;
@@ -849,10 +1083,10 @@ class DownloadHandler(http.server.BaseHTTPRequestHandler):
       .links a {
         padding: 8px 12px;
         border-radius: 10px;
-        background: #1f2937;
+        background: #1b2842;
         color: var(--text);
         text-decoration: none;
-        border: 1px solid #334155;
+        border: 1px solid var(--border);
         font-size: 13px;
       }
       .footer { margin-top: 18px; font-size: 12px; color: var(--muted); }
@@ -868,19 +1102,48 @@ class DownloadHandler(http.server.BaseHTTPRequestHandler):
         <p>메인 도메인 전체 다운로드 또는 특정 상품 URL 단건 다운로드를 지원합니다.</p>
         <form id="downloadForm">
           <div class="grid">
-            <div>
+            <div class="section">
               <label>메인 도메인</label>
               <input type="text" name="base" placeholder="https://www.celladix.hk" />
-              <label>사이트맵 URL (선택)</label>
-              <input type="text" name="sitemap" placeholder="https://www.celladix.hk/sitemap.xml" />
-              <label>최대 상품 수 (선택)</label>
-              <input type="number" name="max_products" placeholder="0 = 전체" />
             </div>
-            <div>
+            <div class="section">
               <label>특정 상품 상세 URL</label>
-              <input type="text" name="product_url" placeholder="https://www.celladix.hk/products/..." />
+              <div id="productList"></div>
+              <button type="button" class="secondary" id="addProductBtn" style="width:100%; margin-top:6px;">+ URL 추가</button>
+            </div>
+            <div class="section">
+              <label class="toggle">
+                <input type="checkbox" id="toggleAdvanced" />
+                사이트맵/최대상품수 열기
+              </label>
+              <div id="advancedFields" style="display:none; margin-top:8px;">
+                <label>사이트맵 URL (선택)</label>
+                <input type="text" name="sitemap" placeholder="https://www.celladix.hk/sitemap.xml" />
+                <label>최대 상품 수 (선택)</label>
+                <input type="number" name="max_products" placeholder="0 = 전체" />
+              </div>
+            </div>
+            <div class="section">
               <label>요청 간 딜레이(초)</label>
               <input type="number" name="delay" step="0.1" value="0.5" />
+            </div>
+            <div class="section">
+              <label>외부 서버 Base URL (선택)</label>
+              <input type="text" name="external_base" value="https://objectstorage.ap-chuncheon-1.oraclecloud.com/n/axgvkldvr9i4/b/isamogu-media-bucket/o" />
+            </div>
+            <div class="section">
+              <label>폴더명 (선택)</label>
+              <input type="text" name="external_folder" placeholder="Celladix_HK" />
+            </div>
+            <div class="section">
+              <label>파일 접두어 (선택)</label>
+              <input type="text" name="external_prefix" placeholder="Celladix_" />
+            </div>
+            <div class="section">
+              <label class="toggle">
+                <input type="checkbox" name="thumbs_only" />
+                썸네일만 다운로드
+              </label>
             </div>
           </div>
           <div class="actions">
@@ -907,9 +1170,13 @@ class DownloadHandler(http.server.BaseHTTPRequestHandler):
       const barFill = document.getElementById('barFill');
       const metaText = document.getElementById('metaText');
       const statusText = document.getElementById('statusText');
+      const productList = document.getElementById('productList');
+      const addProductBtn = document.getElementById('addProductBtn');
       const resultLinks = document.getElementById('resultLinks');
       const downloadLink = document.getElementById('downloadLink');
       const openFolderLink = document.getElementById('openFolderLink');
+      const toggleAdvanced = document.getElementById('toggleAdvanced');
+      const advancedFields = document.getElementById('advancedFields');
 
       function setStatus(msg, ok) {
         statusText.textContent = msg;
@@ -946,6 +1213,33 @@ class DownloadHandler(http.server.BaseHTTPRequestHandler):
         });
       }
 
+      function addProductRow(value) {
+        const row = document.createElement('div');
+        row.className = 'row-inline';
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.name = 'product_url';
+        input.placeholder = 'https://www.celladix.hk/products/...';
+        if (value) input.value = value;
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'secondary';
+        btn.textContent = '- 제거';
+        btn.addEventListener('click', () => {
+          row.remove();
+        });
+        row.appendChild(input);
+        row.appendChild(btn);
+        productList.appendChild(row);
+      }
+
+      addProductBtn.addEventListener('click', () => addProductRow(''));
+      addProductRow('');
+
+      toggleAdvanced.addEventListener('change', () => {
+        advancedFields.style.display = toggleAdvanced.checked ? 'block' : 'none';
+      });
+
       form.addEventListener('submit', (e) => {
         e.preventDefault();
         const formData = new FormData(form);
@@ -981,14 +1275,22 @@ class DownloadHandler(http.server.BaseHTTPRequestHandler):
         if self.path != "/start":
             self.send_error(404, "Not Found")
             return
+        # Avoid hanging forever on incomplete POST bodies
+        try:
+            self.connection.settimeout(10)
+        except Exception:
+            pass
         length = int(self.headers.get("Content-Length", "0"))
         data = self.rfile.read(length).decode("utf-8")
         params = urllib.parse.parse_qs(data)
         base = (params.get("base", [""])[0] or "").strip()
         sitemap = (params.get("sitemap", [""])[0] or "").strip()
-        product_url = (params.get("product_url", [""])[0] or "").strip()
+        product_urls = [p.strip() for p in params.get("product_url", []) if p.strip()]
         delay_raw = (params.get("delay", ["0.5"])[0] or "0.5").strip()
         max_raw = (params.get("max_products", ["0"])[0] or "0").strip()
+        external_base = (params.get("external_base", [""])[0] or "").strip()
+        external_folder = (params.get("external_folder", [""])[0] or "").strip()
+        external_prefix = (params.get("external_prefix", [""])[0] or "").strip()
 
         try:
             delay = float(delay_raw)
@@ -1005,10 +1307,14 @@ class DownloadHandler(http.server.BaseHTTPRequestHandler):
         job_params = {
             "base": base,
             "sitemap": sitemap,
-            "product_url": product_url,
+            "product_url": product_urls,
             "delay": delay,
             "max_products": max_products,
             "output_root": output_root,
+            "external_base": external_base,
+            "external_folder": external_folder,
+            "external_prefix": external_prefix,
+            "thumbs_only": bool(params.get("thumbs_only")),
         }
         thread = threading.Thread(target=_run_job, args=(job_id, job_params), daemon=True)
         thread.start()
@@ -1022,7 +1328,7 @@ class DownloadHandler(http.server.BaseHTTPRequestHandler):
 
 
 def run_web_server(host: str, port: int, output_root: str) -> int:
-    server = http.server.HTTPServer((host, port), DownloadHandler)
+    server = http.server.ThreadingHTTPServer((host, port), DownloadHandler)
     setattr(server, "output_root", output_root)
     print(f"Web server running at http://{host}:{port}")
     try:
@@ -1046,6 +1352,7 @@ def main() -> int:
     parser.add_argument("--max-products", type=int, default=0, help="Limit number of products (0 = no limit)")
     parser.add_argument("--debug", action="store_true", help="Print debug info for image extraction")
     parser.add_argument("--product-url", default="", help="Single product detail URL")
+    parser.add_argument("--thumbs-only", action="store_true", help="Download thumbnails only")
     parser.add_argument("--web", action="store_true", help="Run as a local web server")
     parser.add_argument("--host", default="127.0.0.1", help="Web server host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000, help="Web server port (default: 8000)")
@@ -1065,7 +1372,7 @@ def main() -> int:
 
     if args.product_url:
         try:
-            run_for_product(args.product_url, out_dir, debug=args.debug)
+            run_for_product(args.product_url, out_dir, debug=args.debug, thumbs_only=args.thumbs_only)
         except Exception as exc:
             print(f"Failed product: {exc}")
             return 1
@@ -1079,7 +1386,15 @@ def main() -> int:
     base = args.base.rstrip("/")
     sitemap_url = args.sitemap or f"{base}/sitemap.xml"
 
-    run_for_base(base, out_dir, sitemap_url, args.delay, args.max_products, args.debug)
+    run_for_base(
+        base,
+        out_dir,
+        sitemap_url,
+        args.delay,
+        args.max_products,
+        args.debug,
+        thumbs_only=args.thumbs_only,
+    )
 
     print("Done")
     return 0
